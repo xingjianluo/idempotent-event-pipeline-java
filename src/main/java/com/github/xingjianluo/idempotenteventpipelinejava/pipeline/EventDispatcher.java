@@ -90,7 +90,9 @@ public class EventDispatcher {
     }
 
     private void poll() {
-        List<EventRecord> due = store.findDue(Instant.now(), BATCH_SIZE);
+        // 队首阻塞语义：每个顺序键只取最早的一条 PENDING；队首还在退避等待时整键跳过，
+        // 保证“前一条未成功也未进死信，后一条绝不先投出去”。
+        List<EventRecord> due = store.findDispatchableHeads(Instant.now(), BATCH_SIZE);
         for (EventRecord event : due) {
             if (!running) {
                 return;

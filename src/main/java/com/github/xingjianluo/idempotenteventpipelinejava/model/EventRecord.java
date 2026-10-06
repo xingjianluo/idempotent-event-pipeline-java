@@ -1,10 +1,13 @@
 package com.github.xingjianluo.idempotenteventpipelinejava.model;
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+
 import java.time.Instant;
 
 /**
  * 一条待投递事件的持久化记录。
  */
+@JsonIgnoreProperties(ignoreUnknown = true)
 public class EventRecord {
 
     private String id;
@@ -19,6 +22,14 @@ public class EventRecord {
     private Instant createdAt;
     private Instant updatedAt;
     private long version;
+    /** 已生效的死信重投次数。 */
+    private int replayCount;
+    /** 重投次数上限（提交时从配置快照）。 */
+    private int maxReplays;
+    /** 最近一次重投生效时间。 */
+    private Instant lastReplayAt;
+    /** 最近一次因超过重投上限被拒绝的原因（保留供排查）。 */
+    private String lastReplayRejectReason;
 
     public EventRecord() {
     }
@@ -117,5 +128,42 @@ public class EventRecord {
 
     public void setVersion(long version) {
         this.version = version;
+    }
+
+    public int getReplayCount() {
+        return replayCount;
+    }
+
+    public void setReplayCount(int replayCount) {
+        this.replayCount = replayCount;
+    }
+
+    public int getMaxReplays() {
+        return maxReplays;
+    }
+
+    public void setMaxReplays(int maxReplays) {
+        this.maxReplays = maxReplays;
+    }
+
+    public Instant getLastReplayAt() {
+        return lastReplayAt;
+    }
+
+    public void setLastReplayAt(Instant lastReplayAt) {
+        this.lastReplayAt = lastReplayAt;
+    }
+
+    public String getLastReplayRejectReason() {
+        return lastReplayRejectReason;
+    }
+
+    public void setLastReplayRejectReason(String lastReplayRejectReason) {
+        this.lastReplayRejectReason = lastReplayRejectReason;
+    }
+
+    /** 剩余可重投次数（派生字段，不持久化）。 */
+    public int getRemainingReplays() {
+        return Math.max(0, maxReplays - replayCount);
     }
 }

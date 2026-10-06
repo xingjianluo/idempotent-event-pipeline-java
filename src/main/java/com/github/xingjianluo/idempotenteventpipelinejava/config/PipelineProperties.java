@@ -23,6 +23,12 @@ public class PipelineProperties {
     /** 调度器轮询间隔（毫秒）。 */
     private long pollIntervalMs = 100;
 
+    /** 单条死信事件最大重投次数，超过后拒绝重投。 */
+    private int maxReplays = 3;
+
+    /** 批量重投单次允许的最大条数上限（请求参数超过时按此值截断）。 */
+    private int replayBatchMaxLimit = 100;
+
     public String getStorePath() {
         return storePath;
     }
@@ -61,5 +67,21 @@ public class PipelineProperties {
 
     public void setPollIntervalMs(long pollIntervalMs) {
         this.pollIntervalMs = pollIntervalMs;
+    }
+
+    public int getMaxReplays() {
+        return maxReplays;
+    }
+
+    public void setMaxReplays(int maxReplays) {
+        this.maxReplays = maxReplays;
+    }
+
+    public int getReplayBatchMaxLimit() {
+        return replayBatchMaxLimit;
+    }
+
+    public void setReplayBatchMaxLimit(int replayBatchMaxLimit) {
+        this.replayBatchMaxLimit = replayBatchMaxLimit;
     }
 }

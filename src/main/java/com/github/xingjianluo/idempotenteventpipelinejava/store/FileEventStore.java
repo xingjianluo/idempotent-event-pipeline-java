@@ -5,6 +5,8 @@ import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.github.xingjianluo.idempotenteventpipelinejava.model.EventRecord;
 import com.github.xingjianluo.idempotenteventpipelinejava.model.EventStatus;
+import com.github.xingjianluo.idempotenteventpipelinejava.model.ReplayOutcome;
+import com.github.xingjianluo.idempotenteventpipelinejava.model.ReplayResult;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -141,6 +143,24 @@ public class FileEventStore implements EventStore {
     }
 
     @Override
+    public List<EventRecord> findDispatchableHeads(Instant now, int limit) {
+        synchronized (lock) {
+            // 每个顺序键只保留最早的一条 PENDING 作为队首（createdAt 相同则按插入序）。
+            Map<String, EventRecord> headByOrderKey = new LinkedHashMap<>();
+            byId.values().stream()
+                    .filter(r -> r.getStatus() == EventStatus.PENDING)
+                    .sorted(Comparator.comparing(EventRecord::getCreatedAt))
+                    .forEach(r -> headByOrderKey.putIfAbsent(r.getOrderKey(), r));
+            // 队首未到期（退避等待中）则整键阻塞，后续事件不得越过。
+            return headByOrderKey.values().stream()
+                    .filter(r -> !r.getNextAttemptAt().isAfter(now))
+                    .sorted(Comparator.comparing(EventRecord::getCreatedAt))
+                    .limit(limit)
+                    .toList();
+        }
+    }
+
+    @Override
     public boolean claim(String id, long expectedVersion) {
         synchronized (lock) {
             EventRecord record = byId.get(id);
@@ -241,6 +261,96 @@ public class FileEventStore implements EventStore {
             return byId.values().stream()
                     .filter(r -> r.getStatus() == EventStatus.DEAD_LETTER)
                     .toList();
+        }
+    }
+
+    @Override
+    public ReplayResult replay(String id, int maxReplays) {
+        synchronized (lock) {
+            EventRecord record = byId.get(id);
+            if (record == null) {
+                log.info("重投被拒绝: id={} 原因=事件不存在", id);
+                return new ReplayResult(ReplayOutcome.NOT_FOUND, null, "事件不存在: " + id);
+            }
+            if (record.getStatus() != EventStatus.DEAD_LETTER) {
+                // 并发/重复重投时，只有第一个请求能把事件从死信重置走，其余走到这里被拒绝。
+                String reason = "仅死信事件可重投，当前状态为 " + record.getStatus();
+                log.info("重投被拒绝: id={} idempotencyKey={} status={} 原因={}",
+                        record.getId(), record.getIdempotencyKey(), record.getStatus(), reason);
+                return new ReplayResult(ReplayOutcome.NOT_DEAD_LETTER, record, reason);
+            }
+            int effectiveMax = effectiveMaxReplays(record, maxReplays);
+            if (record.getReplayCount() >= effectiveMax) {
+                String reason = "重投次数已达上限: replayCount=" + record.getReplayCount()
+                        + " maxReplays=" + effectiveMax;
+                record.setLastReplayRejectReason(reason);
+                record.setVersion(record.getVersion() + 1);
+                record.setUpdatedAt(Instant.now());
+                persist(record);
+                log.warn("重投被拒绝（超限）: id={} idempotencyKey={} replayCount={} maxReplays={}",
+                        record.getId(), record.getIdempotencyKey(),
+                        record.getReplayCount(), effectiveMax);
+                return new ReplayResult(ReplayOutcome.QUOTA_EXCEEDED, record, reason);
+            }
+            // 重新入队：保留原 createdAt 以维持同顺序键中的原始位置，开启新一轮投递尝试。
+            EventStatus from = record.getStatus();
+            record.setStatus(EventStatus.PENDING);
+            record.setAttempts(0);
+            record.setNextAttemptAt(Instant.now());
+            record.setReplayCount(record.getReplayCount() + 1);
+            record.setLastReplayAt(record.getNextAttemptAt());
+            record.setLastReplayRejectReason(null);
+            record.setVersion(record.getVersion() + 1);
+            record.setUpdatedAt(Instant.now());
+            persist(record);
+            log.info("死信重投生效: id={} idempotencyKey={} orderKey={} replayCount={}/{} {} -> {}",
+                    record.getId(), record.getIdempotencyKey(), record.getOrderKey(),
+                    record.getReplayCount(), effectiveMax, from, record.getStatus());
+            return new ReplayResult(ReplayOutcome.REPLAYED, record, null);
+        }
+    }
+
+    /** 老数据（重投字段缺失，maxReplays=0）回退到当前配置值。 */
+    private int effectiveMaxReplays(EventRecord record, int configuredMaxReplays) {
+        return record.getMaxReplays() > 0 ? record.getMaxReplays() : configuredMaxReplays;
+    }
+
+    @Override
+    public List<ReplayResult> replayBatch(int limit, int maxReplays) {
+        synchronized (lock) {
+            List<EventRecord> dead = byId.values().stream()
+                    .filter(r -> r.getStatus() == EventStatus.DEAD_LETTER)
+                    .sorted(Comparator.comparing(EventRecord::getCreatedAt))
+                    .toList();
+            List<ReplayResult> results = new ArrayList<>();
+            int replayed = 0;
+            for (EventRecord record : dead) {
+                if (replayed >= limit) {
+                    break; // 达到批量上限，剩余死信留待下次，避免长时间占用存储锁
+                }
+                ReplayResult result = replay(record.getId(), maxReplays);
+                results.add(result);
+                if (result.replayed()) {
+                    replayed++;
+                }
+            }
+            log.info("批量重投完成: limit={} 生效={} 拒绝={}", limit, replayed, results.size() - replayed);
+            return results;
+        }
+    }
+
+    @Override
+    public Map<String, Long> replayStats() {
+        synchronized (lock) {
+            long totalReplays = 0;
+            long eventsReplayed = 0;
+            for (EventRecord record : byId.values()) {
+                totalReplays += record.getReplayCount();
+                if (record.getReplayCount() > 0) {
+                    eventsReplayed++;
+                }
+            }
+            return Map.of("totalReplays", totalReplays, "eventsReplayed", eventsReplayed);
         }
     }
 }
