@@ -72,9 +72,11 @@ class EventApiTest {
         Map byKey = rest.getForObject("/api/events/by-key/api-key-1", Map.class);
         assertThat(byKey.get("id")).isEqualTo(eventId);
 
-        Map<String, Number> stats = rest.getForObject("/api/stats", Map.class);
+        Map<String, Object> stats = rest.getForObject("/api/stats", Map.class);
         log.info("整体统计: {}", stats);
-        assertThat(stats.get("DELIVERED").longValue()).isEqualTo(1L);
+        Map<String, Number> byStatus = (Map<String, Number>) stats.get("byStatus");
+        assertThat(byStatus.get("DELIVERED").longValue()).isEqualTo(1L);
+        assertThat(((Number) stats.get("totalRequeues")).longValue()).isGreaterThanOrEqualTo(0L);
     }
 
     @Test
@@ -91,9 +93,79 @@ class EventApiTest {
         });
         var deadLetters = rest.getForObject("/api/dead-letters", java.util.List.class);
         Map event = rest.getForObject("/api/events/by-key/api-key-fail", Map.class);
-        log.info("死信查询: idempotencyKey={} attempts={} lastError={}",
-                event.get("idempotencyKey"), event.get("attempts"), event.get("lastError"));
-        assertThat(deadLetters).hasSize(1);
+        log.info("死信查询: idempotencyKey={} attempts={} lastError={} 死信总数={}",
+                event.get("idempotencyKey"), event.get("attempts"), event.get("lastError"),
+                deadLetters.size());
+        // 共享上下文中其他用例也会产生死信，这里确认目标事件在死信列表中
+        assertThat(deadLetters).anySatisfy(e ->
+                assertThat(((Map) e).get("idempotencyKey")).isEqualTo("api-key-fail"));
         assertThat((String) event.get("lastError")).contains("模拟消费失败");
+    }
+
+    @Test
+    void deadLetterCanBeRequeuedViaApiAndDuplicateRequeueIsRejected() {
+        Map<String, String> request = Map.of(
+                "idempotencyKey", "api-key-requeue",
+                "orderKey", "order-rq",
+                "payload", "FAIL then requeue");
+        String eventId = (String) rest.postForEntity("/api/events", request, Map.class)
+                .getBody().get("eventId");
+
+        await().atMost(Duration.ofSeconds(10)).until(() -> {
+            Map event = rest.getForObject("/api/events/" + eventId, Map.class);
+            return EventStatus.DEAD_LETTER.name().equals(event.get("status"));
+        });
+
+        // 单条重投生效
+        ResponseEntity<Map> requeued = rest.postForEntity(
+                "/api/dead-letters/" + eventId + "/requeue", null, Map.class);
+        log.info("单条重投: eventId={} status={} body={}", eventId, requeued.getStatusCode(), requeued.getBody());
+        assertThat(requeued.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(requeued.getBody().get("outcome")).isEqualTo("REQUEUED");
+        assertThat(((Number) requeued.getBody().get("requeueCount")).intValue()).isEqualTo(1);
+
+        // 已重新入队（非死信），重复重投被 409 拒绝且原因可区分
+        ResponseEntity<Map> duplicate = rest.postForEntity(
+                "/api/dead-letters/" + eventId + "/requeue", null, Map.class);
+        log.info("重复重投被拒: status={} body={}", duplicate.getStatusCode(), duplicate.getBody());
+        assertThat(duplicate.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(duplicate.getBody().get("outcome")).isEqualTo("NOT_DEAD_LETTER");
+
+        // 单条查询可见重投次数与剩余配额
+        await().atMost(Duration.ofSeconds(5)).until(() -> {
+            Map event = rest.getForObject("/api/events/" + eventId, Map.class);
+            return ((Number) event.get("requeueCount")).intValue() == 1;
+        });
+        Map event = rest.getForObject("/api/events/" + eventId, Map.class);
+        log.info("重投后单条查询: requeueCount={} lastRequeuedAt={} remainingRequeues={}",
+                event.get("requeueCount"), event.get("lastRequeuedAt"), event.get("remainingRequeues"));
+        assertThat(event.get("lastRequeuedAt")).isNotNull();
+
+        // 统计中可见重投情况
+        Map<String, Object> stats = rest.getForObject("/api/stats", Map.class);
+        log.info("重投后统计: {}", stats);
+        assertThat(((Number) stats.get("totalRequeues")).longValue()).isGreaterThanOrEqualTo(1L);
+    }
+
+    @Test
+    void batchRequeueViaApiRespectsLimit() {
+        // 造两条死信（默认消费者对含 FAIL 的负载抛异常）
+        for (int i = 0; i < 2; i++) {
+            rest.postForEntity("/api/events", Map.of(
+                    "idempotencyKey", "api-batch-" + i,
+                    "orderKey", "order-batch-" + i,
+                    "payload", "FAIL batch"), Map.class);
+        }
+        await().atMost(Duration.ofSeconds(10)).until(() -> {
+            Map<String, Object> stats = rest.getForObject("/api/stats", Map.class);
+            Map<String, Number> byStatus = (Map<String, Number>) stats.get("byStatus");
+            return byStatus.get("DEAD_LETTER").longValue() >= 2L;
+        });
+
+        ResponseEntity<Map> batch = rest.postForEntity(
+                "/api/dead-letters/requeue-batch", Map.of("limit", 100), Map.class);
+        log.info("批量重投: status={} body={}", batch.getStatusCode(), batch.getBody());
+        assertThat(batch.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(((Number) batch.getBody().get("requeued")).longValue()).isGreaterThanOrEqualTo(2L);
     }
 }

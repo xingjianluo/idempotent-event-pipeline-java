@@ -2,6 +2,7 @@ package com.github.xingjianluo.idempotenteventpipelinejava.store;
 
 import com.github.xingjianluo.idempotenteventpipelinejava.model.EventRecord;
 import com.github.xingjianluo.idempotenteventpipelinejava.model.EventStatus;
+import com.github.xingjianluo.idempotenteventpipelinejava.model.RequeueResult;
 
 import java.time.Instant;
 import java.util.List;
@@ -46,7 +47,29 @@ public interface EventStore {
 
     List<EventRecord> findDeadLetters();
 
+    /**
+     * 单条死信重投（幂等）：仅当事件处于 DEAD_LETTER 且重投次数未超上限时生效，
+     * 原子地重置为 PENDING 并累加重投次数；其余情况返回可区分的拒绝结果。
+     *
+     * @param maxRequeues 该事件允许的最大重投次数
+     */
+    RequeueResult requeue(String id, int maxRequeues);
+
+    /**
+     * 批量死信重投：按提交先后最多重投 limit 条死信（已超配额的跳过且不占额度）。
+     *
+     * @return 每条被处理死信的结果（含生效与配额拒绝）
+     */
+    List<RequeueResult> requeueBatch(int limit, int maxRequeues);
+
+    /** 重投统计：累计生效重投次数与发生过重投的事件数。 */
+    RequeueStats requeueStats();
+
     /** 插入结果：区分“新建”与“命中已有幂等键”。 */
     record InsertOutcome(boolean inserted, EventRecord record) {
+    }
+
+    /** 重投统计快照。 */
+    record RequeueStats(long totalRequeues, long requeuedEvents) {
     }
 }

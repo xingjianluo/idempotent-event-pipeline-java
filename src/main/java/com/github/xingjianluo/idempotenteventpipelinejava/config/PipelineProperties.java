@@ -23,6 +23,12 @@ public class PipelineProperties {
     /** 调度器轮询间隔（毫秒）。 */
     private long pollIntervalMs = 100;
 
+    /** 单条死信允许的最大重投次数，超过后拒绝重投。 */
+    private int maxRequeues = 3;
+
+    /** 单次批量重投的数量上限，避免大批量重投挤占正常事件调度。 */
+    private int requeueBatchMax = 50;
+
     public String getStorePath() {
         return storePath;
     }
@@ -61,5 +67,21 @@ public class PipelineProperties {
 
     public void setPollIntervalMs(long pollIntervalMs) {
         this.pollIntervalMs = pollIntervalMs;
+    }
+
+    public int getMaxRequeues() {
+        return maxRequeues;
+    }
+
+    public void setMaxRequeues(int maxRequeues) {
+        this.maxRequeues = maxRequeues;
+    }
+
+    public int getRequeueBatchMax() {
+        return requeueBatchMax;
+    }
+
+    public void setRequeueBatchMax(int requeueBatchMax) {
+        this.requeueBatchMax = requeueBatchMax;
     }
 }

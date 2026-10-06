@@ -19,6 +19,12 @@ public class EventRecord {
     private Instant createdAt;
     private Instant updatedAt;
     private long version;
+    /** 已生效的死信重投次数。 */
+    private int requeueCount;
+    /** 允许的最大重投次数（提交时从配置快照）。 */
+    private int maxRequeues;
+    /** 最近一次重投生效时间。 */
+    private Instant lastRequeuedAt;
 
     public EventRecord() {
     }
@@ -117,5 +123,34 @@ public class EventRecord {
 
     public void setVersion(long version) {
         this.version = version;
+    }
+
+    public int getRequeueCount() {
+        return requeueCount;
+    }
+
+    public void setRequeueCount(int requeueCount) {
+        this.requeueCount = requeueCount;
+    }
+
+    public int getMaxRequeues() {
+        return maxRequeues;
+    }
+
+    public void setMaxRequeues(int maxRequeues) {
+        this.maxRequeues = maxRequeues;
+    }
+
+    public Instant getLastRequeuedAt() {
+        return lastRequeuedAt;
+    }
+
+    public void setLastRequeuedAt(Instant lastRequeuedAt) {
+        this.lastRequeuedAt = lastRequeuedAt;
+    }
+
+    /** 剩余可重投次数（基于记录内快照的 maxRequeues 计算，不为负）。 */
+    public int getRemainingRequeues() {
+        return Math.max(0, maxRequeues - requeueCount);
     }
 }

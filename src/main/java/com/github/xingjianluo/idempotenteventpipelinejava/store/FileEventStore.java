@@ -1,10 +1,13 @@
 package com.github.xingjianluo.idempotenteventpipelinejava.store;
 
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.github.xingjianluo.idempotenteventpipelinejava.model.EventRecord;
 import com.github.xingjianluo.idempotenteventpipelinejava.model.EventStatus;
+import com.github.xingjianluo.idempotenteventpipelinejava.model.RequeueOutcome;
+import com.github.xingjianluo.idempotenteventpipelinejava.model.RequeueResult;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -45,7 +48,9 @@ public class FileEventStore implements EventStore {
         this.file = file;
         this.mapper = new ObjectMapper()
                 .registerModule(new JavaTimeModule())
-                .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
+                .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)
+                // 容忍派生属性（如 remainingRequeues）与历史快照中缺失/多余的字段
+                .disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES);
         load();
     }
 
@@ -131,9 +136,22 @@ public class FileEventStore implements EventStore {
     @Override
     public List<EventRecord> findDue(Instant now, int limit) {
         synchronized (lock) {
+            // 每个顺序键内最早的未完成（PENDING/IN_FLIGHT）事件创建时间：
+            // 同键后续事件必须等它成功或进死信后才能被调度，哪怕它还在退避等待中。
+            Map<String, Instant> headByOrderKey = new LinkedHashMap<>();
+            for (EventRecord r : byId.values()) {
+                if (r.getStatus() == EventStatus.PENDING || r.getStatus() == EventStatus.IN_FLIGHT) {
+                    headByOrderKey.merge(r.getOrderKey(), r.getCreatedAt(),
+                            (a, b) -> a.isBefore(b) ? a : b);
+                }
+            }
             return byId.values().stream()
                     .filter(r -> r.getStatus() == EventStatus.PENDING)
                     .filter(r -> !r.getNextAttemptAt().isAfter(now))
+                    .filter(r -> {
+                        Instant head = headByOrderKey.get(r.getOrderKey());
+                        return head == null || !head.isBefore(r.getCreatedAt());
+                    })
                     .sorted(Comparator.comparing(EventRecord::getCreatedAt))
                     .limit(limit)
                     .toList();
@@ -241,6 +259,87 @@ public class FileEventStore implements EventStore {
             return byId.values().stream()
                     .filter(r -> r.getStatus() == EventStatus.DEAD_LETTER)
                     .toList();
+        }
+    }
+
+    @Override
+    public RequeueResult requeue(String id, int maxRequeues) {
+        synchronized (lock) {
+            EventRecord record = byId.get(id);
+            if (record == null) {
+                log.info("重投拒绝: id={} 原因=事件不存在", id);
+                return new RequeueResult(RequeueOutcome.NOT_FOUND, null, "事件不存在: id=" + id);
+            }
+            return doRequeue(record, maxRequeues);
+        }
+    }
+
+    @Override
+    public List<RequeueResult> requeueBatch(int limit, int maxRequeues) {
+        synchronized (lock) {
+            List<RequeueResult> results = new ArrayList<>();
+            List<EventRecord> dead = byId.values().stream()
+                    .filter(r -> r.getStatus() == EventStatus.DEAD_LETTER)
+                    .sorted(Comparator.comparing(EventRecord::getCreatedAt))
+                    .toList();
+            int requeued = 0;
+            for (EventRecord record : dead) {
+                if (requeued >= limit) {
+                    break;
+                }
+                RequeueResult result = doRequeue(record, maxRequeues);
+                if (result.outcome() == RequeueOutcome.REQUEUED) {
+                    requeued++;
+                    results.add(result);
+                } else if (result.outcome() == RequeueOutcome.QUOTA_EXCEEDED) {
+                    // 超配额的死信跳过且不占批量额度，结果一并返回便于观察
+                    results.add(result);
+                }
+            }
+            log.info("批量重投完成: limit={} 生效={} 配额拒绝={}",
+                    limit, requeued, results.size() - requeued);
+            return results;
+        }
+    }
+
+    /** 在锁内执行单条重投校验与状态迁移，保证并发/重复重投只生效一次。 */
+    private RequeueResult doRequeue(EventRecord record, int maxRequeues) {
+        if (record.getStatus() != EventStatus.DEAD_LETTER) {
+            String reason = "仅死信可重投，当前状态=" + record.getStatus();
+            log.info("重投拒绝: id={} idempotencyKey={} 原因={}",
+                    record.getId(), record.getIdempotencyKey(), reason);
+            return new RequeueResult(RequeueOutcome.NOT_DEAD_LETTER, record, reason);
+        }
+        if (record.getRequeueCount() >= maxRequeues) {
+            String reason = "重投次数已达上限: requeueCount=" + record.getRequeueCount()
+                    + " maxRequeues=" + maxRequeues;
+            log.warn("重投拒绝: id={} idempotencyKey={} 原因={} lastError={}",
+                    record.getId(), record.getIdempotencyKey(), reason, record.getLastError());
+            return new RequeueResult(RequeueOutcome.QUOTA_EXCEEDED, record, reason);
+        }
+        // 重新入队：回到 PENDING 立即参与调度，attempts 归零获得新一轮重试额度，
+        // createdAt 保持不变，按原来的先后位置参与同顺序键排队；lastError 保留。
+        record.setRequeueCount(record.getRequeueCount() + 1);
+        record.setLastRequeuedAt(Instant.now());
+        transition(record, EventStatus.PENDING, 0, record.getLastError(), Instant.now());
+        log.info("死信重投生效: id={} idempotencyKey={} orderKey={} requeueCount={}/{}",
+                record.getId(), record.getIdempotencyKey(), record.getOrderKey(),
+                record.getRequeueCount(), maxRequeues);
+        return new RequeueResult(RequeueOutcome.REQUEUED, record, null);
+    }
+
+    @Override
+    public RequeueStats requeueStats() {
+        synchronized (lock) {
+            long total = 0;
+            long events = 0;
+            for (EventRecord r : byId.values()) {
+                if (r.getRequeueCount() > 0) {
+                    events++;
+                    total += r.getRequeueCount();
+                }
+            }
+            return new RequeueStats(total, events);
         }
     }
 }
